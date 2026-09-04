@@ -1,7 +1,7 @@
 ---
 sdk: gradio
 app_file: app.py
----
+--- 
 
 # Microphone Spike Detector
 
