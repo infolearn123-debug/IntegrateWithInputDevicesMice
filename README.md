@@ -25,6 +25,34 @@ pip install -r requirements.txt
 python app.py
 ```
 
+Local setup (recommended)
+
+This project is tested with Python 3.10. If you have a newer system Python (for
+example 3.13) you may encounter wheel/build errors for packages like `numpy`.
+Follow these steps on Windows to create a Python 3.10 virtual environment and
+run the app:
+
+```powershell
+# Install Python 3.10 from https://www.python.org/downloads/ if you don't have it
+# Create a venv with the 3.10 interpreter (uses the py launcher)
+py -3.10 -m venv .venv
+. .venv\Scripts\Activate.ps1    # PowerShell
+# or use: .venv\Scripts\activate for cmd.exe
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+python app.py
+```
+
+If you prefer conda you can create a conda env instead:
+
+```powershell
+conda create -n mic-spike python=3.10 -y
+conda activate mic-spike
+pip install -r requirements.txt
+python app.py
+```
+
+
 What it uses
 
 - `gradio` for the web UI

@@ -1,0 +1,374 @@
+<!doctype html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <title>Microphone Spike Detector (Flask)</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #f6f7fb
+        }
+
+        .panel {
+            border: 1px solid #ddd;
+            padding: 12px;
+            border-radius: 6px;
+            background: #fff
+        }
+
+        .panel h3 {
+            margin: 0 0 8px 0;
+            font-size: 16px
+        }
+
+        #controls {
+            margin-bottom: 12px;
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            flex-wrap: wrap
+        }
+
+        #visuals {
+            display: flex;
+            gap: 12px;
+            margin-top: 12px;
+            flex-wrap: wrap
+        }
+
+        #log {
+            white-space: pre-wrap;
+            font-family: monospace;
+            margin-top: 12px
+        }
+
+        canvas {
+            background: #fff
+        }
+
+        .alert-badge {
+            width: 100%;
+            text-align: center;
+            padding: 8px;
+            border-radius: 6px;
+            font-weight: bold;
+            background: #eee;
+            color: #333
+        }
+
+        .alert-badge.active {
+            background: #cc3333;
+            color: #fff;
+            box-shadow: 0 0 8px rgba(204, 51, 51, 0.6);
+        }
+
+        #bigAlert.hidden {
+            display: none
+        }
+    </style>
+</head>
+
+<body>
+    <h2>Microphone Spike Detector (Flask)</h2>
+    <div id="bigAlert"
+        style="display:none;margin-top:8px;padding:10px;border-radius:6px;font-weight:bold;color:#fff;background:#cc0000;text-align:center">
+        ALERT</div>
+
+    <div class="panel">
+        <h3>Controls</h3>
+        <div id="controls">
+            <button id="recBtn">Start Recording</button>
+            <button id="stopBtn" disabled>Stop & Analyze</button>
+            <label for="deviceSelect">Input device:</label>
+            <select id="deviceSelect" style="min-width:220px"></select>
+            <button id="refreshDevices" title="Refresh device list">Refresh</button>
+            <label for="silenceThresh">Silence threshold:</label>
+            <input id="silenceThresh" type="range" min="0" max="0.01" step="0.0001" value="0.001" />
+            <input id="silenceVal" type="number" step="0.0001" min="0" max="1" value="0.001" style="width:80px" />
+        </div>
+    </div>
+
+    <div id="visuals" style="display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;margin-top:12px">
+        <div class="panel" style="flex:1;min-width:320px;max-width:740px">
+            <h3>Audio — Live Visuals</h3>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <canvas id="waveformCanvas" width="700" height="120" style="border:1px solid #ccc"></canvas>
+                <canvas id="spectrogramCanvas" width="700" height="140" style="border:1px solid #ccc"></canvas>
+            </div>
+        </div>
+
+        <div class="panel" style="width:360px;display:flex;flex-direction:column;gap:8px;align-items:center">
+            <h3>Video + Alerts</h3>
+            <video id="liveVideo" width="320" height="240" autoplay playsinline
+                style="border:1px solid #ccc; display:none;"></video>
+            <canvas id="energyCanvas" width="320" height="120" style="border:1px solid #ccc"></canvas>
+            <div style="width:100%">
+                <label for="alertThresh" style="display:block;margin-bottom:6px">Alert threshold (dB):</label>
+                <input id="alertThresh" type="range" min="-80" max="0" step="0.5" value="-40" style="width:100%" />
+            </div>
+            <div id="liveAlert" class="alert-badge" style="margin-top:6px">(none)</div>
+            <div style="margin-top:6px"><strong>Detection:</strong> <span id="alertText">(none)</span></div>
+            <div style="margin-top:6px"><strong>Emergency:</strong> <span id="emergencyLabel"
+                    style="font-weight:bold;color:darkred">(none)</span></div>
+        </div>
+    </div>
+
+    <div class="panel" style="margin-top:12px">
+        <h3>Server Analysis</h3>
+        <div><img id="analysisImg" alt="Analysis" style="max-width:600px; border:1px solid #ccc" /></div>
+        <div id="log" style="margin-top:8px"></div>
+    </div>
+
+    <script>
+        // Elements
+        const recBtn = document.getElementById('recBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const alertText = document.getElementById('alertText');
+        const analysisImg = document.getElementById('analysisImg');
+        const logDiv = document.getElementById('log');
+        const silenceThreshRange = document.getElementById('silenceThresh');
+        const silenceValInput = document.getElementById('silenceVal');
+        const waveformCanvas = document.getElementById('waveformCanvas');
+        const waveformCtx = waveformCanvas.getContext('2d');
+        const spectrogramCanvas = document.getElementById('spectrogramCanvas');
+        const spectCtx = spectrogramCanvas.getContext('2d');
+        const energyCanvas = document.getElementById('energyCanvas');
+        const energyCtx = energyCanvas.getContext('2d');
+        const alertThresh = document.getElementById('alertThresh');
+        const liveAlert = document.getElementById('liveAlert');
+        const emergencyLabel = document.getElementById('emergencyLabel');
+
+        // audio state
+        let audioContext, source, processor, chunks = [], sampleRate;
+        let analyser, freqData, timeData;
+
+        // speech recognizer for keyword (Help)
+        let recognizer = null;
+        // camera state
+        let cameraStream = null;
+        const liveVideo = document.getElementById('liveVideo');
+
+        async function startCamera() {
+            if (cameraStream) return; // already running
+            try {
+                cameraStream = await navigator.mediaDevices.getUserMedia({ video: true });
+                liveVideo.srcObject = cameraStream;
+                liveVideo.style.display = 'block';
+            } catch (err) {
+                console.warn('Camera permission denied or not available', err);
+            }
+        }
+
+        function captureSnapshot() {
+            if (!cameraStream) return null;
+            try {
+                const v = liveVideo;
+                const c = document.createElement('canvas');
+                c.width = v.videoWidth || 320; c.height = v.videoHeight || 240;
+                const ctx = c.getContext('2d');
+                ctx.drawImage(v, 0, 0, c.width, c.height);
+                const dataUrl = c.toDataURL('image/png');
+                // convert dataURL to blob
+                const arr = dataUrl.split(',')[1];
+                const bstr = atob(arr);
+                let n = bstr.length; const u8 = new Uint8Array(n);
+                while (n--) u8[n] = bstr.charCodeAt(n);
+                return new Blob([u8], { type: 'image/png' });
+            } catch (e) { return null; }
+        }
+
+        function stopCamera() {
+            if (!cameraStream) return;
+            try {
+                const tracks = cameraStream.getTracks();
+                for (let t of tracks) t.stop();
+            } catch (e) { }
+            cameraStream = null;
+            liveVideo.srcObject = null;
+            liveVideo.style.display = 'none';
+        }
+
+        // keep range and numeric input in sync
+        silenceThreshRange.addEventListener('input', (e) => { silenceValInput.value = e.target.value; });
+        silenceValInput.addEventListener('input', (e) => { silenceThreshRange.value = e.target.value; });
+
+        // device list
+        async function listInputDevices() {
+            const select = document.getElementById('deviceSelect');
+            select.innerHTML = '';
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const inputs = devices.filter(d => d.kind === 'audioinput');
+                if (inputs.length === 0) {
+                    const opt = document.createElement('option'); opt.text = 'No audio input devices found'; opt.value = ''; select.appendChild(opt); return;
+                }
+                const defaultOpt = document.createElement('option'); defaultOpt.text = 'Default device'; defaultOpt.value = ''; select.appendChild(defaultOpt);
+                for (let d of inputs) {
+                    const opt = document.createElement('option'); opt.value = d.deviceId; opt.text = d.label || ('audioinput ' + d.deviceId); select.appendChild(opt);
+                }
+            } catch (err) {
+                const opt = document.createElement('option'); opt.text = 'Permission required to list devices'; opt.value = ''; select.appendChild(opt);
+            }
+        }
+
+        document.getElementById('refreshDevices').addEventListener('click', listInputDevices);
+        listInputDevices();
+
+        // visualization helpers
+        function drawWaveform(buf) {
+            const w = waveformCanvas.width, h = waveformCanvas.height;
+            waveformCtx.fillStyle = '#fff'; waveformCtx.fillRect(0, 0, w, h);
+            waveformCtx.lineWidth = 1; waveformCtx.strokeStyle = '#0077cc';
+            waveformCtx.beginPath();
+            const step = Math.max(1, Math.floor(buf.length / w));
+            for (let i = 0; i < w; i++) {
+                const idx = i * step;
+                const y = (0.5 + (buf[idx] || 0) / 2) * h;
+                if (i === 0) waveformCtx.moveTo(i, y); else waveformCtx.lineTo(i, y);
+            }
+            waveformCtx.stroke();
+        }
+
+        function drawSpectrogramColumn(freq) {
+            const w = spectrogramCanvas.width, h = spectrogramCanvas.height;
+            const img = spectCtx.getImageData(1, 0, w - 1, h);
+            spectCtx.putImageData(img, 0, 0);
+            const colX = w - 1;
+            for (let y = 0; y < h; y++) {
+                const bin = Math.floor((1 - y / h) * freq.length);
+                const v = freq[bin];
+                spectCtx.fillStyle = colormap(v);
+                spectCtx.fillRect(colX, y, 1, 1);
+            }
+        }
+
+        function colormap(v) {
+            const t = v / 255;
+            const r = Math.floor(255 * Math.min(1, 2 * t));
+            const g = Math.floor(255 * Math.max(0, Math.min(1, 2 * (t - 0.25))));
+            const b = Math.floor(255 * Math.max(0, 1 - 2 * t));
+            return `rgb(${r},${g},${b})`;
+        }
+
+        function computeRMS(buf) {
+            let sum = 0; for (let i = 0; i < buf.length; i++) { const v = buf[i]; sum += v * v; }
+            return Math.sqrt(sum / buf.length || 0);
+        }
+
+        function drawEnergy(rms) {
+            const w = energyCanvas.width, h = energyCanvas.height;
+            energyCtx.fillStyle = '#fff'; energyCtx.fillRect(0, 0, w, h);
+            const db = 20 * Math.log10(rms + 1e-12);
+            const barH = Math.max(0, Math.min(h, (db + 80) / 80 * h));
+            // color by level relative to threshold
+            const thresh = parseFloat(alertThresh.value) || -40;
+            const color = db > thresh ? '#cc3333' : '#28a745';
+            energyCtx.fillStyle = color; energyCtx.fillRect(10, h - barH, w - 20, barH);
+            energyCtx.fillStyle = '#000'; energyCtx.fillText(db.toFixed(1) + ' dB', 10, 12);
+        }
+
+        function checkAlert(rms, freq) {
+            const db = 20 * Math.log10(rms + 1e-12);
+            const thresh = parseFloat(alertThresh.value) || -40;
+            const maxBin = Math.max(...freq);
+            const spike = (db > thresh) || (maxBin > 200);
+            if (spike) {
+                liveAlert.textContent = 'SPIKE'; liveAlert.classList.add('active');
+                alertText.textContent = 'SPIKE';
+                const big = document.getElementById('bigAlert');
+                big.textContent = `SPIKE ALERT — ${db.toFixed(1)} dB`;
+                big.style.display = 'block';
+            } else {
+                liveAlert.textContent = '(none)'; liveAlert.classList.remove('active');
+                alertText.textContent = '(none)';
+                const big = document.getElementById('bigAlert');
+                big.style.display = 'none';
+            }
+        }
+
+        function encodeWAV(samples, sampleRate) {
+            const bufferLength = samples.length * 2 + 44; const buffer = new ArrayBuffer(bufferLength); const view = new DataView(buffer);
+            function writeString(view, offset, string) { for (let i = 0; i < string.length; i++) view.setUint8(offset + i, string.charCodeAt(i)); }
+            let offset = 0; writeString(view, offset, 'RIFF'); offset += 4; view.setUint32(offset, 36 + samples.length * 2, true); offset += 4; writeString(view, offset, 'WAVE'); offset += 4; writeString(view, offset, 'fmt '); offset += 4; view.setUint32(offset, 16, true); offset += 4; view.setUint16(offset, 1, true); offset += 2; view.setUint16(offset, 1, true); offset += 2; view.setUint32(offset, sampleRate, true); offset += 4; view.setUint32(offset, sampleRate * 2, true); offset += 4; view.setUint16(offset, 2, true); offset += 2; view.setUint16(offset, 16, true); offset += 2; writeString(view, offset, 'data'); offset += 4; view.setUint32(offset, samples.length * 2, true); offset += 4;
+            for (let i = 0; i < samples.length; i++) { const s = Math.max(-1, Math.min(1, samples[i])); view.setInt16(offset + i * 2, s < 0 ? s * 0x8000 : s * 0x7FFF, true); }
+            return new Blob([view], { type: 'audio/wav' });
+        }
+
+        // Recording start
+        recBtn.onclick = async () => {
+            const deviceSelect = document.getElementById('deviceSelect');
+            const selectedDeviceId = deviceSelect && deviceSelect.value ? deviceSelect.value : null;
+            const audioConstraints = selectedDeviceId ? { deviceId: { exact: selectedDeviceId } } : true;
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            sampleRate = audioContext.sampleRate;
+            source = audioContext.createMediaStreamSource(stream);
+            analyser = audioContext.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.2;
+            freqData = new Uint8Array(analyser.frequencyBinCount); timeData = new Float32Array(analyser.fftSize);
+            source.connect(analyser);
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
+            analyser.connect(processor); processor.connect(audioContext.destination);
+            processor.onaudioprocess = (e) => {
+                const data = e.inputBuffer.getChannelData(0); chunks.push(new Float32Array(data));
+                try { analyser.getFloatTimeDomainData(timeData); } catch (err) { for (let i = 0; i < Math.min(timeData.length, data.length); i++) timeData[i] = data[i]; }
+                analyser.getByteFrequencyData(freqData);
+                drawWaveform(timeData); drawSpectrogramColumn(freqData);
+                const rms = computeRMS(timeData); drawEnergy(rms); checkAlert(rms, freqData);
+            };
+            recBtn.disabled = true; stopBtn.disabled = false; alertText.textContent = 'Recording...'; emergencyLabel.textContent = '(none)';
+
+            // start speech recognition for keyword detection
+            try {
+                const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                if (SpeechRecognition) {
+                    recognizer = new SpeechRecognition(); recognizer.continuous = true; recognizer.interimResults = false; recognizer.lang = 'en-US';
+                    recognizer.onresult = (ev) => {
+                        for (let i = ev.resultIndex; i < ev.results.length; i++) {
+                            const txt = ev.results[i][0].transcript || '';
+                            if (txt.toLowerCase().includes('help')) {
+                                emergencyLabel.textContent = 'EMERGENCY: help detected';
+                                emergencyLabel.style.color = 'red';
+                                // auto-enable camera for video capture
+                                startCamera();
+                                // take a snapshot after camera starts and POST to server
+                                setTimeout(async () => {
+                                    try {
+                                        const snap = captureSnapshot();
+                                        if (snap) {
+                                            const form = new FormData();
+                                            form.append('snapshot', snap, 'snapshot.png');
+                                            await fetch('/snapshot', { method: 'POST', body: form });
+                                        }
+                                    } catch (err) { console.warn('snapshot send failed', err); }
+                                }, 800);
+                            }
+                        }
+                    };
+                    recognizer.onerror = (err) => { /* ignore */ };
+                    recognizer.start();
+                }
+            } catch (err) { /* ignore */ }
+        };
+
+        // Stop and upload
+        stopBtn.onclick = async () => {
+            try { processor && processor.disconnect(); source && source.disconnect(); } catch (e) { }
+            if (recognizer) { try { recognizer.stop(); } catch (e) { } recognizer = null; }
+            // stop camera when stopping recording
+            stopCamera();
+            let totalLen = 0; for (let c of chunks) totalLen += c.length; let samples = new Float32Array(totalLen); let offset = 0; for (let c of chunks) { samples.set(c, offset); offset += c.length; }
+            if (samples.length === 0) { alertText.textContent = 'No sound captured'; chunks = []; recBtn.disabled = false; stopBtn.disabled = true; return; }
+            let maxAmp = 0; for (let i = 0; i < samples.length; i++) { const v = Math.abs(samples[i]); if (v > maxAmp) maxAmp = v; }
+            const uiThresh = parseFloat(silenceValInput.value) || 0.001; if (maxAmp < uiThresh) { alertText.textContent = 'No sound captured'; chunks = []; recBtn.disabled = false; stopBtn.disabled = true; return; }
+            const wavBlob = encodeWAV(samples, sampleRate); const form = new FormData(); form.append('audio', wavBlob, 'capture.wav'); alertText.textContent = 'Uploading...';
+            const resp = await fetch('/analyze', { method: 'POST', body: form });
+            const data = await resp.json(); if (data.error) { alertText.textContent = data.error; return; }
+            analysisImg.src = 'data:image/png;base64,' + data.image_base64; alertText.textContent = data.alert; logDiv.textContent = data.log;
+            chunks = []; recBtn.disabled = false; stopBtn.disabled = true;
+        };
+    </script>
+</body>
+
+</html>
