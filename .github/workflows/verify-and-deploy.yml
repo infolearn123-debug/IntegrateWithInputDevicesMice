@@ -44,7 +44,7 @@ jobs:
         run: |
           set -e
           git init
-          git remote add hf https://$HF_TOKEN@huggingface.co/spaces/$HF_USERNAME/$HF_SPACE
+          git remote add hf "https://$HF_TOKEN@huggingface.co/spaces/${{ secrets.HF_USERNAME }}/IntegrateWithInputDevicesMice" || true
           git add -A
           git commit -m "Deploy from GitHub Actions: $GITHUB_SHA" || true
           git push --force hf HEAD:main
